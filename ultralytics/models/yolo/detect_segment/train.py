@@ -91,27 +91,31 @@ class DetectSegmentTrainer(yolo.detect.DetectionTrainer):
             )
 
     def _filter_supervised(self, batch, branch):
-        """Return labels for *branch* keeping the full batch grid.
+        """Return only images supervised for *branch*, compacting batch indices for plotting.
 
-        Images unsupervised for *branch* still occupy their grid cell (without
-        boxes/masks); only their labels are dropped. batch_idx stays as original
-        image indices so plot_images can place labels on the correct cell.
+        A paired batch can contain detection-only or segmentation-only images. The visualization for one
+        branch should not retain the other branch's images as blank grid cells, so image tensors, paths,
+        masks, and batch indices are all filtered and remapped to a compact batch-local index space.
         """
         supervised = batch[f"{branch}_supervised"]
-        if not supervised.any():
+        image_idx = supervised.nonzero(as_tuple=False).flatten()
+        if not len(image_idx):
             return None
-        src_idx = batch[f"{branch}_batch_idx"]
-        # 只保留 supervised 图的标签，batch_idx 保持原始图索引（不压缩）。
-        mask = (src_idx[:, None] == supervised.nonzero(as_tuple=False).flatten()).any(1)
+
+        src_idx = batch[f"{branch}_batch_idx"].long()
+        # Map original batch indices to compact indices (e.g. [1, 3] -> [0, 1]).
+        index_map = torch.full((len(supervised),), -1, dtype=torch.long, device=src_idx.device)
+        index_map[image_idx] = torch.arange(len(image_idx), device=src_idx.device)
+        label_mask = index_map[src_idx] >= 0
         labels = {
-            "img": batch["img"],
-            "cls": batch[f"{branch}_cls"][mask],
-            "bboxes": batch[f"{branch}_bboxes"][mask],
-            "batch_idx": src_idx[mask],
+            "img": batch["img"][image_idx],
+            "cls": batch[f"{branch}_cls"][label_mask],
+            "bboxes": batch[f"{branch}_bboxes"][label_mask],
+            "batch_idx": index_map[src_idx[label_mask]],
         }
         if branch == "segment" and "segment_masks" in batch:
-            labels["masks"] = batch["segment_masks"]
-        paths = list(batch["im_file"])
+            labels["masks"] = batch["segment_masks"][image_idx]
+        paths = [batch["im_file"][int(i)] for i in image_idx]
         return labels, paths
 
     def plot_training_samples(self, batch, ni) -> None:
