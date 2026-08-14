@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -651,21 +652,36 @@ class v8SegmentationLoss(v8DetectionLoss):
 class _DetectSegmentLossModel(torch.nn.Module):
     """Expose one composite child head through the stock loss-model contract."""
 
-    def __init__(self, model: torch.nn.Module, branch: str):
-        """Bind one composite branch while retaining the model hyperparameters."""
+    def __init__(self, model: torch.nn.Module, branch: str, args=None):
+        """Bind one composite branch, optionally with branch-specific hyperparameter overrides."""
         super().__init__()
-        self.args = model.args
+        self.args = args if args is not None else model.args
         self.model = torch.nn.ModuleList([getattr(model.model[-1], branch)])
         self.class_weights = getattr(model, "class_weights", None)
+
+
+def _detect_segment_branch_args(args, prefix: str):
+    """Return args with box/cls/dfl gains overridden by {prefix}_* values when explicitly configured."""
+    overrides = {
+        key: value
+        for key in ("box", "cls", "dfl")
+        if (value := getattr(args, f"{prefix}_{key}", None)) is not None
+    }
+    if not overrides:
+        return args
+    branch_args = copy(args)
+    for key, value in overrides.items():
+        setattr(branch_args, key, value)
+    return branch_args
 
 
 class DetectSegmentLoss:
     """Combine independent stock detection and segmentation criteria for one composite forward."""
 
     def __init__(self, model: torch.nn.Module):
-        """Initialize branch criteria against their child heads."""
-        detect_model = _DetectSegmentLossModel(model, "detect")
-        segment_model = _DetectSegmentLossModel(model, "segment")
+        """Initialize branch criteria against their child heads, honoring per-branch loss gains."""
+        detect_model = _DetectSegmentLossModel(model, "detect", _detect_segment_branch_args(model.args, "det"))
+        segment_model = _DetectSegmentLossModel(model, "segment", _detect_segment_branch_args(model.args, "seg"))
         self.end2end = model.end2end
         self.detect = E2ELoss(detect_model, v8DetectionLoss) if self.end2end else v8DetectionLoss(detect_model)
         self.segment = E2ELoss(segment_model, v8SegmentationLoss) if self.end2end else v8SegmentationLoss(segment_model)

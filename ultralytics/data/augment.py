@@ -1924,75 +1924,57 @@ class DetectSegmentLetterBox(LetterBox):
 
 
 class DetectSegmentRandomFlip(RandomFlip):
-    """Apply one shared horizontal coin flip to paired detection and segmentation instances."""
-
-    def __init__(self, p: float = 0.5) -> None:
-        """Initialize a horizontal-only flip for the paired target streams."""
-        super().__init__(p=p, direction="horizontal")
+    """Apply one shared coin flip to paired detection and segmentation instances."""
 
     def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Compute flip parameters from the shared image; paired labels carry no single 'instances' entry."""
-        w = labels["img"].shape[1]
+        h, w = labels["img"].shape[:2]
         if labels["detect_instances"].normalized:
-            w = 1
-        return {"flip": random.random() < self.p, "w": w, "direction": self.direction, "flip_idx": self.flip_idx}
+            h = w = 1
+        return {"flip": random.random() < self.p, "h": h, "w": w, "direction": self.direction, "flip_idx": self.flip_idx}
 
     def apply_instances(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
-        """Flip both target streams with the same coin flip; Instances.fliplr handles bboxes and segments."""
+        """Flip both target streams with the same coin flip; Instances.flip* handles bboxes and segments."""
         if params["flip"]:
             for key in ("detect_instances", "segment_instances"):
                 labels[key].convert_bbox(format="xywh")
-                labels[key].fliplr(params["w"])
+                if params["direction"] == "vertical":
+                    labels[key].flipud(params["h"])
+                else:
+                    labels[key].fliplr(params["w"])
         return labels
 
 
-class DetectSegmentRandomTranslateScale(BaseTransform):
-    """Apply one shared small translation + scale jitter to paired detection and segmentation targets.
+class DetectSegmentRandomPerspective(RandomPerspective):
+    """Apply one shared affine/perspective transform to paired detection and segmentation targets.
 
-    Restricted to axis-aligned affine (no rotation/shear) so bounding boxes stay rectangular and polygon
-    segments transform identically to the image. Intended for small magnitudes on fixed-camera data.
+    The parent's get_params/apply_image only touch the image, so they are reused as-is; only instance
+    application needs to fan out to the two independent branches and their class arrays.
     """
 
-    def __init__(self, translate: float = 0.1, scale: float = 0.1, border: tuple[int, int, int] = (114, 114, 114)):
-        """Initialize jitter ranges; translate is a fraction of image size, scale is symmetric gain."""
-        assert 0 <= translate <= 1, f"translate should be in range [0, 1], but got {translate}"
-        assert 0 <= scale < 1, f"scale should be in range [0, 1), but got {scale}"
-        self.translate = translate
-        self.scale = scale
-        self.border = border
-
-    def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """Sample one affine shared by the image and both target streams."""
-        h, w = labels["img"].shape[:2]
-        s = 1.0 + random.uniform(-self.scale, self.scale)
-        return {
-            "scale": s,
-            "offset_w": w * 0.5 * (1.0 - s) + random.uniform(-self.translate, self.translate) * w,
-            "offset_h": h * 0.5 * (1.0 - s) + random.uniform(-self.translate, self.translate) * h,
-            "w": w,
-            "h": h,
-        }
-
-    def apply_image(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
-        """Warp the image with the shared affine, padding exposed areas with the letterbox gray."""
-        if params["scale"] != 1.0 or params["offset_w"] or params["offset_h"]:
-            matrix = np.array(
-                [[params["scale"], 0, params["offset_w"]], [0, params["scale"], params["offset_h"]]], dtype=np.float32
-            )
-            labels["img"] = cv2.warpAffine(
-                labels["img"], matrix, (params["w"], params["h"]), borderValue=self.border
-            )
-        return labels
-
-    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
-        """Transform both target streams with the shared affine, then clip and drop zero-area boxes."""
-        for key in ("detect_instances", "segment_instances"):
-            instances = labels[key]
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Transform both target streams with the shared matrix and filter distorted instances per branch."""
+        for inst_key, cls_key in (("detect_instances", "detect_cls"), ("segment_instances", "segment_cls")):
+            instances = labels[inst_key]
             instances.convert_bbox(format="xyxy")
-            instances.scale(params["scale"], params["scale"])
-            instances.add_padding(params["offset_w"], params["offset_h"])
-            instances.clip(params["w"], params["h"])
-            instances.remove_zero_area_boxes()
+            instances.denormalize(*params["orig_shape"][::-1])  # no-op after LetterBox (already absolute)
+
+            bboxes = self.apply_bboxes(instances.bboxes, params["M"])
+            segments = instances.segments
+            if len(segments):  # segments redefine tight bboxes after warping
+                bboxes, segments = self.apply_segments(segments, params["M"], params["size"])
+            new_instances = Instances(bboxes, segments, bbox_format="xyxy", normalized=False)
+            new_instances.clip(*params["size"])
+
+            # Area-ratio candidates compare against scale-only old boxes, mirroring the parent implementation
+            instances.scale(scale_w=params["scale"], scale_h=params["scale"], bbox_only=True)
+            i = self.box_candidates(
+                box1=instances.bboxes.T,
+                box2=new_instances.bboxes.T,
+                area_thr=0.01 if len(segments) else 0.10,
+            )
+            labels[inst_key] = new_instances[i]
+            labels[cls_key] = labels[cls_key][i]
         return labels
 
 
