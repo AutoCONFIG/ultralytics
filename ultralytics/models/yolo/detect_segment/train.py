@@ -89,25 +89,27 @@ class DetectSegmentTrainer(yolo.detect.DetectionTrainer):
             )
 
     def _filter_supervised(self, batch, branch):
-        """Return only images supervised for *branch*, with remapped batch_idx."""
+        """Return labels for *branch* keeping the full batch grid.
+
+        Images unsupervised for *branch* still occupy their grid cell (without
+        boxes/masks); only their labels are dropped. batch_idx stays as original
+        image indices so plot_images can place labels on the correct cell.
+        """
         supervised = batch[f"{branch}_supervised"]
-        indices = supervised.nonzero(as_tuple=False).flatten()
-        if indices.numel() == 0:
+        if not supervised.any():
             return None
         src_idx = batch[f"{branch}_batch_idx"]
-        mask = (src_idx[:, None] == indices).any(1)
-        remapped = torch.empty(src_idx.shape[0], dtype=src_idx.dtype, device=src_idx.device)
-        for compact, original in enumerate(indices.tolist()):
-            remapped[src_idx == original] = compact
+        # 只保留 supervised 图的标签，batch_idx 保持原始图索引（不压缩）。
+        mask = (src_idx[:, None] == supervised.nonzero(as_tuple=False).flatten()).any(1)
         labels = {
-            "img": batch["img"][indices],
+            "img": batch["img"],
             "cls": batch[f"{branch}_cls"][mask],
             "bboxes": batch[f"{branch}_bboxes"][mask],
-            "batch_idx": remapped[mask],
+            "batch_idx": src_idx[mask],
         }
         if branch == "segment" and "segment_masks" in batch:
-            labels["masks"] = batch["segment_masks"][indices]
-        paths = [batch["im_file"][i] for i in indices.tolist()]
+            labels["masks"] = batch["segment_masks"]
+        paths = list(batch["im_file"])
         return labels, paths
 
     def plot_training_samples(self, batch, ni) -> None:

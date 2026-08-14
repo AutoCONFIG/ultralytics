@@ -158,25 +158,26 @@ class DetectSegmentValidator(DetectionValidator):
         self.segment_validator.print_results()
 
     def _filter_supervised(self, batch, branch):
-        """Return (labels, paths) for only images supervised for *branch*, with remapped batch_idx."""
+        """Return labels for *branch* keeping the full batch grid.
+
+        Images unsupervised for *branch* still occupy their grid cell (without
+        boxes/masks); only their labels are dropped. batch_idx stays as original
+        image indices so plot_images can place labels on the correct cell.
+        """
         supervised = batch[f"{branch}_supervised"]
-        indices = supervised.nonzero(as_tuple=False).flatten()
-        if indices.numel() == 0:
+        if not supervised.any():
             return None
         src_idx = batch[f"{branch}_batch_idx"]
-        mask = (src_idx[:, None] == indices).any(1)
-        remapped = torch.empty(src_idx.shape[0], dtype=src_idx.dtype, device=src_idx.device)
-        for compact, original in enumerate(indices.tolist()):
-            remapped[src_idx == original] = compact
+        mask = (src_idx[:, None] == supervised.nonzero(as_tuple=False).flatten()).any(1)
         labels = {
-            "img": batch["img"][indices],
+            "img": batch["img"],
             "cls": batch[f"{branch}_cls"][mask],
             "bboxes": batch[f"{branch}_bboxes"][mask],
-            "batch_idx": remapped[mask],
+            "batch_idx": src_idx[mask],
         }
         if branch == "segment" and "segment_masks" in batch:
-            labels["masks"] = batch["segment_masks"][indices]
-        paths = [batch["im_file"][i] for i in indices.tolist()]
+            labels["masks"] = batch["segment_masks"]
+        paths = list(batch["im_file"])
         return labels, paths
 
     def plot_val_samples(self, batch, ni) -> None:
@@ -195,30 +196,28 @@ class DetectSegmentValidator(DetectionValidator):
             )
 
     def plot_predictions(self, batch, preds, ni) -> None:
-        """Plot detection and segmentation predictions per branch, only supervised images."""
+        """Plot detection and segmentation predictions per branch, keeping full batch grid."""
         for branch, branch_preds in (("detect", preds[0]), ("segment", preds[1])):
             if not branch_preds:
                 continue
             supervised = batch[f"{branch}_supervised"]
-            indices = supervised.nonzero(as_tuple=False).flatten()
-            if indices.numel() == 0:
+            if not supervised.any():
                 continue
             names = self.data[f"{branch}_names"]
             max_det = self.args.max_det
-            # Only collect preds for supervised images
-            selected_preds = [branch_preds[i] for i in indices.tolist()]
-            for compact_i, pred in enumerate(selected_preds):
-                pred["batch_idx"] = torch.ones_like(pred["conf"]) * compact_i
-            keys = selected_preds[0].keys()
-            batched_preds = {k: torch.cat([x[k][:max_det] for x in selected_preds], dim=0) for k in keys}
+            # 保持原始图索引，让 plot_images 把预测放到正确的网格位置。
+            indices = supervised.nonzero(as_tuple=False).flatten()
+            for i in indices.tolist():
+                branch_preds[i]["batch_idx"] = torch.ones_like(branch_preds[i]["conf"]) * i
+            keys = branch_preds[indices[0]].keys()
+            batched_preds = {k: torch.cat([branch_preds[i][k][:max_det] for i in indices.tolist()], dim=0) for k in keys}
             batched_preds["bboxes"] = ops.xyxy2xywh(batched_preds["bboxes"])
             if branch == "segment":
                 batched_preds["masks"] = torch.as_tensor(batched_preds["masks"], dtype=torch.uint8).cpu()
-            paths = [batch["im_file"][i] for i in indices.tolist()]
             plot_images(
-                images=batch["img"][indices],
+                images=batch["img"],
                 labels=batched_preds,
-                paths=paths,
+                paths=list(batch["im_file"]),
                 fname=self.save_dir / f"val_batch{branch}{ni}_pred.jpg",
                 names=names,
                 on_plot=self.on_plot,
