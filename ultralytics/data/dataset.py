@@ -24,8 +24,12 @@ from .augment import (
     Albumentations,
     Compose,
     DepthFormat,
+    DetectSegmentCopyPaste,
+    DetectSegmentCutMix,
     DetectSegmentFormat,
     DetectSegmentLetterBox,
+    DetectSegmentMixUp,
+    DetectSegmentMosaic,
     DetectSegmentRandomFlip,
     DetectSegmentRandomPerspective,
     Format,
@@ -522,22 +526,14 @@ class DetectSegmentDataset(YOLODataset):
         return label
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
-        """Build the paired pipeline: shared LetterBox, affine jitter, image-only HSV, and synchronized flips."""
+        """Build the paired pipeline, mirroring v8_transforms ordering when mixing augmentations are enabled."""
         if self.augment:
-            unsupported = [name for name in ("mosaic", "mixup", "cutmix", "copy_paste") if getattr(hyp, name)]
-            if unsupported:
-                raise ValueError(f"detect-segment does not support paired augmentation: {', '.join(unsupported)}")
-        transforms = Compose([DetectSegmentLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment)])
-        if self.augment and (hyp.degrees or hyp.translate or hyp.scale or hyp.shear or hyp.perspective):
-            transforms.append(
-                DetectSegmentRandomPerspective(
-                    degrees=hyp.degrees,
-                    translate=hyp.translate,
-                    scale=hyp.scale,
-                    shear=hyp.shear,
-                    perspective=hyp.perspective,
-                )
-            )
+            hyp.mosaic = hyp.mosaic if not self.rect else 0.0
+            hyp.mixup = hyp.mixup if not self.rect else 0.0
+            hyp.cutmix = hyp.cutmix if not self.rect else 0.0
+            transforms = self._build_spatial_transforms(hyp)
+        else:
+            transforms = Compose([DetectSegmentLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
         if self.augment and (augmentations := getattr(hyp, "augmentations", None)):
             albumentations = Albumentations(transforms=augmentations)
             if getattr(albumentations, "contains_spatial", False):
@@ -562,6 +558,50 @@ class DetectSegmentDataset(YOLODataset):
             )
         )
         return transforms
+
+    def _build_spatial_transforms(self, hyp) -> Compose:
+        """Build the geometric/mixing head of the training pipeline (both branches share one image stream)."""
+        if not (hyp.mosaic or hyp.mixup or hyp.cutmix or hyp.copy_paste):
+            transforms = Compose([DetectSegmentLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=True)])
+            if hyp.degrees or hyp.translate or hyp.scale or hyp.shear or hyp.perspective:
+                transforms.append(
+                    DetectSegmentRandomPerspective(
+                        degrees=hyp.degrees,
+                        translate=hyp.translate,
+                        scale=hyp.scale,
+                        shear=hyp.shear,
+                        perspective=hyp.perspective,
+                    )
+                )
+            return transforms
+        # Mixing enabled: mirror v8_transforms — mosaic canvas + affine resize as the shared pre_transform.
+        affine = DetectSegmentRandomPerspective(
+            degrees=hyp.degrees,
+            translate=hyp.translate,
+            scale=hyp.scale,
+            shear=hyp.shear,
+            perspective=hyp.perspective,
+            size=(self.imgsz, self.imgsz),
+        )
+        pre_transform = Compose([DetectSegmentMosaic(self, imgsz=self.imgsz, p=hyp.mosaic), affine])
+        if hyp.copy_paste_mode == "flip":
+            pre_transform.insert(1, DetectSegmentCopyPaste(self, p=hyp.copy_paste, mode=hyp.copy_paste_mode))
+        else:
+            pre_transform.append(
+                DetectSegmentCopyPaste(
+                    self,
+                    pre_transform=Compose([DetectSegmentMosaic(self, imgsz=self.imgsz, p=hyp.mosaic), affine]),
+                    p=hyp.copy_paste,
+                    mode=hyp.copy_paste_mode,
+                )
+            )
+        return Compose(
+            [
+                pre_transform,
+                DetectSegmentMixUp(self, pre_transform=pre_transform, p=hyp.mixup),
+                DetectSegmentCutMix(self, pre_transform=pre_transform, p=hyp.cutmix),
+            ]
+        )
 
     @staticmethod
     def collate_fn(batch: list[dict]) -> dict:

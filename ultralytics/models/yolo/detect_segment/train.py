@@ -80,11 +80,13 @@ class DetectSegmentTrainer(yolo.detect.DetectionTrainer):
             cls = np.concatenate([lb[f"{branch}_cls"] for lb in self.train_loader.dataset.labels], 0)
             if len(cls) == 0:
                 continue
+            save_dir = self.save_dir / branch
+            save_dir.mkdir(parents=True, exist_ok=True)
             plot_labels(
                 boxes,
                 cls.squeeze(1) if cls.ndim == 2 else cls,
                 names=self.data[names_key],
-                save_dir=self.save_dir / branch,
+                save_dir=save_dir,
                 on_plot=self.on_plot,
             )
 

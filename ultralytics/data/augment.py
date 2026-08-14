@@ -1978,6 +1978,111 @@ class DetectSegmentRandomPerspective(RandomPerspective):
         return labels
 
 
+class DetectSegmentMosaic(Mosaic):
+    """Mosaic for paired detect-segment targets: one shared canvas, two independently concatenated branches.
+
+    Note: branches are concatenated from all patches regardless of their supervision flags; on partially
+    supervised datasets a composite may contain pixels without labels for a branch (treated as background).
+    """
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Pad both branches into the shared canvas, then concatenate and clip per branch."""
+        layout = params["layout"]
+        for item in layout:
+            if self.n == 4:
+                padw, padh = item["padw"], item["padh"]
+            else:  # n == 9
+                padw, padh = item["padw"] + self.border[0], item["padh"] + self.border[1]
+            patch = item["labels_patch"]
+            nh, nw = item.get("img_shape") or patch["img"].shape[:2]
+            for key in ("detect_instances", "segment_instances"):
+                patch[key].convert_bbox(format="xyxy")
+                patch[key].denormalize(nw, nh)
+                patch[key].add_padding(padw, padh)
+
+        patches = [item["labels_patch"] for item in layout]
+        imgsz = self.imgsz * 2  # final canvas size after the n == 9 center crop
+        for branch in ("detect", "segment"):
+            cls = np.concatenate([patch[f"{branch}_cls"] for patch in patches], axis=0)
+            instances = Instances.concatenate([patch[f"{branch}_instances"] for patch in patches], axis=0)
+            instances.clip(imgsz, imgsz)
+            good = instances.remove_zero_area_boxes()
+            labels[f"{branch}_cls"] = cls[good]
+            labels[f"{branch}_instances"] = instances
+            labels[f"{branch}_supervised"] = any(patch[f"{branch}_supervised"] for patch in patches)
+        labels["resized_shape"] = (imgsz, imgsz)
+        return labels
+
+
+class DetectSegmentMixUp(MixUp):
+    """MixUp for paired targets: blend the two images, concatenate both branches independently."""
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Concatenate detect/segment instances and class labels from both images."""
+        labels2 = labels["mix_labels"][0]
+        for branch in ("detect", "segment"):
+            labels[f"{branch}_instances"] = Instances.concatenate(
+                [labels[f"{branch}_instances"], labels2[f"{branch}_instances"]], axis=0
+            )
+            labels[f"{branch}_cls"] = np.concatenate([labels[f"{branch}_cls"], labels2[f"{branch}_cls"]], axis=0)
+            labels[f"{branch}_supervised"] = labels[f"{branch}_supervised"] or labels2[f"{branch}_supervised"]
+        return labels
+
+
+class DetectSegmentCutMix(CutMix):
+    """CutMix for paired targets: one shared cut area, per-branch secondary instance selection."""
+
+    def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Pick one cut area avoiding all primary instances, then select secondary instances per branch."""
+        params = BaseMixTransform.get_params(self, labels)
+        h, w = labels["img"].shape[:2]
+        primary = np.concatenate(
+            [labels["detect_instances"].bboxes, labels["segment_instances"].bboxes], axis=0
+        )
+        cut_areas = np.asarray([self._rand_bbox(w, h) for _ in range(self.num_areas)], dtype=np.float32)
+        ioa1 = bbox_ioa(cut_areas, primary)  # (num_areas, num_boxes)
+        idx = np.nonzero(ioa1.sum(axis=1) <= 0)[0]
+        if len(idx) == 0:
+            params["skip"] = True
+            return params
+
+        labels2 = labels["mix_labels"][0]
+        area = cut_areas[np.random.choice(idx)]
+        params.update(area=area, w=w, h=h)
+        for branch in ("detect", "segment"):
+            instances2 = labels2[f"{branch}_instances"]
+            ioa2 = bbox_ioa(area[None], instances2.bboxes).squeeze(0)
+            params[f"{branch}_indexes2"] = np.nonzero(ioa2 >= (0.01 if len(instances2.segments) else 0.1))[0]
+        if not len(params["detect_indexes2"]) and not len(params["segment_indexes2"]):
+            params["skip"] = True
+        return params
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Clip selected secondary instances into the cut area and concatenate per branch."""
+        if params.get("skip"):
+            return labels
+        labels2 = labels["mix_labels"][0]
+        x1, y1, x2, y2 = params["area"].astype(np.int32)
+        for branch in ("detect", "segment"):
+            indexes2 = params[f"{branch}_indexes2"]
+            if not len(indexes2):
+                continue
+            instances2 = labels2[f"{branch}_instances"][indexes2]
+            instances2.convert_bbox("xyxy")
+            instances2.denormalize(params["w"], params["h"])
+            instances2.add_padding(-x1, -y1)
+            instances2.clip(x2 - x1, y2 - y1)
+            instances2.add_padding(x1, y1)
+            labels[f"{branch}_cls"] = np.concatenate(
+                [labels[f"{branch}_cls"], labels2[f"{branch}_cls"][indexes2]], axis=0
+            )
+            labels[f"{branch}_instances"] = Instances.concatenate(
+                [labels[f"{branch}_instances"], instances2], axis=0
+            )
+            labels[f"{branch}_supervised"] = labels[f"{branch}_supervised"] or labels2[f"{branch}_supervised"]
+        return labels
+
+
 class CopyPaste(BaseMixTransform):
     """CopyPaste class for applying Copy-Paste augmentation to image datasets.
 
@@ -2131,6 +2236,84 @@ class CopyPaste(BaseMixTransform):
         mask = mask.copy()
         mask[pasted] = source[pasted]
         labels["semantic_mask"] = mask
+        return labels
+
+
+class DetectSegmentCopyPaste(CopyPaste):
+    """CopyPaste applied to the segmentation branch of paired targets; detection targets are untouched.
+
+    Segment instances carry polygons (hence masks), detection instances do not, so pasting is only
+    meaningful for the segment branch. Pasted instances are checked against both branches' boxes to
+    avoid overlapping already-occupied regions.
+    """
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Apply CopyPaste to segment instances, mirroring the parent's flip/mixup mode semantics."""
+        if len(labels["segment_instances"].segments) == 0 or self.p == 0:
+            return labels
+        if self.mode == "flip":
+            params = self.get_params(labels)
+            labels = self.apply_image(labels, params)
+            labels = self.apply_instances(labels, params)
+            labels = self.apply_semantic(labels, params)
+            return labels
+        return BaseMixTransform.__call__(self, labels)
+
+    def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Compute CopyPaste parameters from the segment branch, checking occupancy against both branches."""
+        params = {}
+        if self.mode == "mixup":
+            params = BaseMixTransform.get_params(self, labels)
+            labels2 = labels.get("mix_labels", [{}])[0]
+        else:
+            labels2 = {}
+
+        h, w = labels["img"].shape[:2]
+        instances = deepcopy(labels["segment_instances"])
+        instances.convert_bbox(format="xyxy")
+        instances.denormalize(w, h)
+
+        instances2 = deepcopy(labels2.get("segment_instances")) if labels2 else None
+        if instances2 is None:
+            instances2 = deepcopy(instances)
+            instances2.fliplr(w)
+        else:
+            instances2.convert_bbox(format="xyxy")
+            instances2.denormalize(w, h)
+
+        occupied = deepcopy(labels["detect_instances"])
+        occupied.convert_bbox(format="xyxy")
+        occupied.denormalize(w, h)
+        occupied = np.concatenate([instances.bboxes, occupied.bboxes], axis=0)
+        ioa = bbox_ioa(instances2.bboxes, occupied)
+        indexes = np.nonzero((ioa < 0.30).all(1))[0]
+        n = len(indexes)
+        sorted_idx = np.argsort(ioa.max(1)[indexes])
+        indexes = indexes[sorted_idx]
+        selected = indexes[: round(self.p * n)]
+
+        params["instances"] = instances
+        params["instances2"] = instances2
+        params["selected"] = selected
+        params["im_new"] = np.zeros((h, w), np.uint8)
+        params["labels2_cls"] = labels2.get("segment_cls")
+        params["labels2_img"] = labels2.get("img")
+        return params
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Concatenate selected instances into the segment branch only."""
+        instances = params["instances"]
+        instances2 = params["instances2"]
+        selected = params["selected"]
+        cls = labels["segment_cls"]
+        labels2_cls = params.get("labels2_cls")
+
+        for j in selected:
+            cls = np.concatenate((cls, (labels2_cls if labels2_cls is not None else cls)[[j]]), axis=0)
+            instances = Instances.concatenate((instances, instances2[[j]]), axis=0)
+
+        labels["segment_cls"] = cls
+        labels["segment_instances"] = instances
         return labels
 
 
