@@ -158,26 +158,33 @@ class DetectSegmentValidator(DetectionValidator):
         self.segment_validator.print_results()
 
     def _filter_supervised(self, batch, branch):
-        """Return labels for *branch* keeping the full batch grid.
+        """Return only images supervised for *branch*, compacting batch indices for plotting.
 
-        Images unsupervised for *branch* still occupy their grid cell (without
-        boxes/masks); only their labels are dropped. batch_idx stays as original
-        image indices so plot_images can place labels on the correct cell.
+        Supervision means the corresponding label file exists; empty label files remain valid negative samples.
+        Images belonging only to the other branch are removed from the branch visualization entirely.
         """
         supervised = batch[f"{branch}_supervised"]
-        if not supervised.any():
+        image_idx = supervised.nonzero(as_tuple=False).flatten()
+        if not len(image_idx):
             return None
-        src_idx = batch[f"{branch}_batch_idx"]
-        mask = (src_idx[:, None] == supervised.nonzero(as_tuple=False).flatten()).any(1)
+
+        src_idx = batch[f"{branch}_batch_idx"].long()
+        index_map = torch.full((len(supervised),), -1, dtype=torch.long, device=src_idx.device)
+        index_map[image_idx] = torch.arange(len(image_idx), device=src_idx.device)
+        label_mask = index_map[src_idx] >= 0
         labels = {
-            "img": batch["img"],
-            "cls": batch[f"{branch}_cls"][mask],
-            "bboxes": batch[f"{branch}_bboxes"][mask],
-            "batch_idx": src_idx[mask],
+            "img": batch["img"][image_idx],
+            "cls": batch[f"{branch}_cls"][label_mask],
+            "bboxes": batch[f"{branch}_bboxes"][label_mask],
+            "batch_idx": index_map[src_idx[label_mask]],
         }
         if branch == "segment" and "segment_masks" in batch:
-            labels["masks"] = batch["segment_masks"]
-        paths = list(batch["im_file"])
+            labels["masks"] = (
+                batch["segment_masks"][image_idx]
+                if self.args.overlap_mask
+                else batch["segment_masks"][label_mask]
+            )
+        paths = [batch["im_file"][int(i)] for i in image_idx]
         return labels, paths
 
     def plot_val_samples(self, batch, ni) -> None:
@@ -196,28 +203,27 @@ class DetectSegmentValidator(DetectionValidator):
             )
 
     def plot_predictions(self, batch, preds, ni) -> None:
-        """Plot detection and segmentation predictions per branch, keeping full batch grid."""
+        """Plot branch predictions only on images supervised for that branch."""
         for branch, branch_preds in (("detect", preds[0]), ("segment", preds[1])):
             if not branch_preds:
                 continue
-            supervised = batch[f"{branch}_supervised"]
-            if not supervised.any():
+            image_idx = batch[f"{branch}_supervised"].nonzero(as_tuple=False).flatten()
+            if not len(image_idx):
                 continue
             names = self.data[f"{branch}_names"]
             max_det = self.args.max_det
-            # 保持原始图索引，让 plot_images 把预测放到正确的网格位置。
-            indices = supervised.nonzero(as_tuple=False).flatten()
-            for i in indices.tolist():
-                branch_preds[i]["batch_idx"] = torch.ones_like(branch_preds[i]["conf"]) * i
-            keys = branch_preds[indices[0]].keys()
-            batched_preds = {k: torch.cat([branch_preds[i][k][:max_det] for i in indices.tolist()], dim=0) for k in keys}
+            selected_preds = [branch_preds[int(i)] for i in image_idx]
+            for compact_idx, pred in enumerate(selected_preds):
+                pred["batch_idx"] = torch.ones_like(pred["conf"]) * compact_idx
+            keys = selected_preds[0].keys()
+            batched_preds = {k: torch.cat([pred[k][:max_det] for pred in selected_preds], dim=0) for k in keys}
             batched_preds["bboxes"] = ops.xyxy2xywh(batched_preds["bboxes"])
             if branch == "segment":
                 batched_preds["masks"] = torch.as_tensor(batched_preds["masks"], dtype=torch.uint8).cpu()
             plot_images(
-                images=batch["img"],
+                images=batch["img"][image_idx],
                 labels=batched_preds,
-                paths=list(batch["im_file"]),
+                paths=[batch["im_file"][int(i)] for i in image_idx],
                 fname=self.save_dir / f"val_batch{branch}{ni}_pred.jpg",
                 names=names,
                 on_plot=self.on_plot,

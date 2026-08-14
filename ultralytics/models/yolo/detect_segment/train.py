@@ -114,7 +114,11 @@ class DetectSegmentTrainer(yolo.detect.DetectionTrainer):
             "batch_idx": index_map[src_idx[label_mask]],
         }
         if branch == "segment" and "segment_masks" in batch:
-            labels["masks"] = batch["segment_masks"][image_idx]
+            labels["masks"] = (
+                batch["segment_masks"][image_idx]
+                if self.args.overlap_mask
+                else batch["segment_masks"][label_mask]
+            )
         paths = [batch["im_file"][int(i)] for i in image_idx]
         return labels, paths
 
