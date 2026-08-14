@@ -26,6 +26,7 @@ from .augment import (
     DepthFormat,
     DetectSegmentFormat,
     DetectSegmentLetterBox,
+    DetectSegmentRandomFlip,
     Format,
     LetterBox,
     RandomLoadText,
@@ -525,9 +526,9 @@ class DetectSegmentDataset(YOLODataset):
             unsupported = [name for name in ("mosaic", "mixup", "cutmix", "copy_paste") if getattr(hyp, name)]
             if unsupported:
                 raise ValueError(f"detect-segment does not support paired augmentation: {', '.join(unsupported)}")
-            if hyp.degrees or hyp.translate or hyp.scale or hyp.shear or hyp.perspective or hyp.fliplr or hyp.flipud:
+            if hyp.degrees or hyp.translate or hyp.scale or hyp.shear or hyp.perspective or hyp.flipud:
                 raise ValueError(
-                    "detect-segment supports only LetterBox and image-only HSV geometric training transforms"
+                    "detect-segment supports only LetterBox, horizontal flip and image-only training transforms"
                 )
         transforms = Compose([DetectSegmentLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment)])
         if self.augment and (augmentations := getattr(hyp, "augmentations", None)):
@@ -539,6 +540,8 @@ class DetectSegmentDataset(YOLODataset):
             from .augment import RandomHSV
 
             transforms.append(RandomHSV(hyp.hsv_h, hyp.hsv_s, hyp.hsv_v))
+        if self.augment and hyp.fliplr:
+            transforms.append(DetectSegmentRandomFlip(p=hyp.fliplr))
         transforms.append(
             DetectSegmentFormat(
                 bbox_format="xywh",

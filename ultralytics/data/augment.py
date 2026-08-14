@@ -1923,6 +1923,29 @@ class DetectSegmentLetterBox(LetterBox):
         return labels
 
 
+class DetectSegmentRandomFlip(RandomFlip):
+    """Apply one shared horizontal coin flip to paired detection and segmentation instances."""
+
+    def __init__(self, p: float = 0.5) -> None:
+        """Initialize a horizontal-only flip for the paired target streams."""
+        super().__init__(p=p, direction="horizontal")
+
+    def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Compute flip parameters from the shared image; paired labels carry no single 'instances' entry."""
+        w = labels["img"].shape[1]
+        if labels["detect_instances"].normalized:
+            w = 1
+        return {"flip": random.random() < self.p, "w": w, "direction": self.direction, "flip_idx": self.flip_idx}
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+        """Flip both target streams with the same coin flip; Instances.fliplr handles bboxes and segments."""
+        if params["flip"]:
+            for key in ("detect_instances", "segment_instances"):
+                labels[key].convert_bbox(format="xywh")
+                labels[key].fliplr(params["w"])
+        return labels
+
+
 class CopyPaste(BaseMixTransform):
     """CopyPaste class for applying Copy-Paste augmentation to image datasets.
 
