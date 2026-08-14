@@ -27,6 +27,7 @@ from .augment import (
     DetectSegmentFormat,
     DetectSegmentLetterBox,
     DetectSegmentRandomFlip,
+    DetectSegmentRandomTranslateScale,
     Format,
     LetterBox,
     RandomLoadText,
@@ -526,11 +527,14 @@ class DetectSegmentDataset(YOLODataset):
             unsupported = [name for name in ("mosaic", "mixup", "cutmix", "copy_paste") if getattr(hyp, name)]
             if unsupported:
                 raise ValueError(f"detect-segment does not support paired augmentation: {', '.join(unsupported)}")
-            if hyp.degrees or hyp.translate or hyp.scale or hyp.shear or hyp.perspective or hyp.flipud:
+            if hyp.degrees or hyp.shear or hyp.perspective or hyp.flipud:
                 raise ValueError(
-                    "detect-segment supports only LetterBox, horizontal flip and image-only training transforms"
+                    "detect-segment supports only LetterBox, horizontal flip, translate/scale jitter "
+                    "and image-only training transforms"
                 )
         transforms = Compose([DetectSegmentLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment)])
+        if self.augment and (hyp.translate or hyp.scale):
+            transforms.append(DetectSegmentRandomTranslateScale(translate=hyp.translate, scale=hyp.scale))
         if self.augment and (augmentations := getattr(hyp, "augmentations", None)):
             albumentations = Albumentations(transforms=augmentations)
             if getattr(albumentations, "contains_spatial", False):

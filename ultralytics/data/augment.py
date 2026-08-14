@@ -1946,6 +1946,56 @@ class DetectSegmentRandomFlip(RandomFlip):
         return labels
 
 
+class DetectSegmentRandomTranslateScale(BaseTransform):
+    """Apply one shared small translation + scale jitter to paired detection and segmentation targets.
+
+    Restricted to axis-aligned affine (no rotation/shear) so bounding boxes stay rectangular and polygon
+    segments transform identically to the image. Intended for small magnitudes on fixed-camera data.
+    """
+
+    def __init__(self, translate: float = 0.1, scale: float = 0.1, border: tuple[int, int, int] = (114, 114, 114)):
+        """Initialize jitter ranges; translate is a fraction of image size, scale is symmetric gain."""
+        assert 0 <= translate <= 1, f"translate should be in range [0, 1], but got {translate}"
+        assert 0 <= scale < 1, f"scale should be in range [0, 1), but got {scale}"
+        self.translate = translate
+        self.scale = scale
+        self.border = border
+
+    def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Sample one affine shared by the image and both target streams."""
+        h, w = labels["img"].shape[:2]
+        s = 1.0 + random.uniform(-self.scale, self.scale)
+        return {
+            "scale": s,
+            "offset_w": w * 0.5 * (1.0 - s) + random.uniform(-self.translate, self.translate) * w,
+            "offset_h": h * 0.5 * (1.0 - s) + random.uniform(-self.translate, self.translate) * h,
+            "w": w,
+            "h": h,
+        }
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+        """Warp the image with the shared affine, padding exposed areas with the letterbox gray."""
+        if params["scale"] != 1.0 or params["offset_w"] or params["offset_h"]:
+            matrix = np.array(
+                [[params["scale"], 0, params["offset_w"]], [0, params["scale"], params["offset_h"]]], dtype=np.float32
+            )
+            labels["img"] = cv2.warpAffine(
+                labels["img"], matrix, (params["w"], params["h"]), borderValue=self.border
+            )
+        return labels
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+        """Transform both target streams with the shared affine, then clip and drop zero-area boxes."""
+        for key in ("detect_instances", "segment_instances"):
+            instances = labels[key]
+            instances.convert_bbox(format="xyxy")
+            instances.scale(params["scale"], params["scale"])
+            instances.add_padding(params["offset_w"], params["offset_h"])
+            instances.clip(params["w"], params["h"])
+            instances.remove_zero_area_boxes()
+        return labels
+
+
 class CopyPaste(BaseMixTransform):
     """CopyPaste class for applying Copy-Paste augmentation to image datasets.
 
