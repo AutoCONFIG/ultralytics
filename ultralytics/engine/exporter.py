@@ -927,6 +927,9 @@ class Exporter:
             self.metadata["kpt_shape"] = model.model[-1].kpt_shape
             if hasattr(model, "kpt_names"):
                 self.metadata["kpt_names"] = model.kpt_names
+        elif model.task == "detect-segment":
+            self.metadata["detect_names"] = model.detect_names
+            self.metadata["segment_names"] = model.segment_names
 
         LOGGER.info(
             f"\n{colorstr('PyTorch:')} starting from '{file}' with input shape {tuple(im.shape)} BCHW and "
@@ -1047,11 +1050,24 @@ class Exporter:
             assert TORCH_1_13, f"'nms=True' ONNX export requires torch>=1.13 (found torch=={TORCH_VERSION})"
 
         f = str(self.file.with_suffix(".onnx"))
-        output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
+        output_names = (
+            ["output0", "output1", "output2"]
+            if self.model.task == "detect-segment"
+            else ["output0", "output1"]
+            if self.model.task == "segment"
+            else ["output0"]
+        )
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
-            if isinstance(self.model, SegmentationModel):
+            if self.model.task == "detect-segment":
+                dynamic["output0"] = {0: "batch"}
+                dynamic["output1"] = {0: "batch"}
+                if not self.model.end2end:
+                    dynamic["output0"][2] = "anchors"
+                    dynamic["output1"][2] = "anchors"
+                dynamic["output2"] = {0: "batch", 2: "mask_height", 3: "mask_width"}
+            elif isinstance(self.model, SegmentationModel):
                 dynamic["output0"] = {0: "batch", 2: "anchors"}  # shape(1, 116, 8400)
                 dynamic["output1"] = {0: "batch", 2: "mask_height", 3: "mask_width"}  # shape(1,32,160,160)
             elif isinstance(self.model, DepthModel):

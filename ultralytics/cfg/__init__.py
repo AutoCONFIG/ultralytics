@@ -56,9 +56,10 @@ SOLUTION_MAP = {
 
 # Define valid tasks and modes
 MODES = frozenset({"train", "val", "predict", "export", "track", "benchmark"})
-TASKS = frozenset({"detect", "segment", "classify", "pose", "obb", "semantic", "depth"})
+TASKS = frozenset({"detect", "detect-segment", "segment", "classify", "pose", "obb", "semantic", "depth"})
 TASK2DATA = {
     "detect": "coco8.yaml",
+    "detect-segment": None,
     "segment": "coco8-seg.yaml",
     "classify": "imagenet10",
     "pose": "coco8-pose.yaml",
@@ -86,6 +87,7 @@ TASK2MODEL = {
 }
 TASK2METRIC = {
     "detect": "metrics/mAP50-95(B)",
+    "detect-segment": "metrics/detect/mAP50-95(B)",
     "segment": "metrics/mAP50-95(M)",
     "classify": "metrics/accuracy_top1",
     "pose": "metrics/mAP50-95(P)",
@@ -1062,7 +1064,7 @@ def entrypoint(debug: str = "") -> None:
             else:
                 raise ValueError(f"Invalid 'task={task}'. Valid tasks are {list(TASKS)}.\n{CLI_HELP_MSG}")
         if "model" not in overrides:
-            overrides["model"] = TASK2MODEL[task]
+            overrides["model"] = "yolo26n-detect-segment.yaml" if task == "detect-segment" else TASK2MODEL[task]
 
     # Model
     model = overrides.pop("model", DEFAULT_CFG.model)

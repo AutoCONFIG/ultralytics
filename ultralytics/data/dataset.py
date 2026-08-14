@@ -21,8 +21,11 @@ from ultralytics.utils.ops import resample_segments, segments2boxes
 from ultralytics.utils.torch_utils import TORCHVISION_0_18
 
 from .augment import (
+    Albumentations,
     Compose,
     DepthFormat,
+    DetectSegmentFormat,
+    DetectSegmentLetterBox,
     Format,
     LetterBox,
     RandomLoadText,
@@ -429,6 +432,141 @@ class YOLODataset(BaseDataset):
             for i in range(len(new_batch["batch_idx"])):
                 new_batch["batch_idx"][i] += i  # add target image index for build_targets()
             new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        return new_batch
+
+
+class DetectSegmentDataset(YOLODataset):
+    """Dataset for paired detection and instance-segmentation labels on one image stream."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.pop("split")
+        super().__init__(*args, **kwargs)
+
+    def _label_paths(self, im_files: list[str], suffix: str) -> list[str]:
+        return [str(path.with_name(f"{path.stem}{suffix}")) for path in map(Path, im_files)]
+
+    def get_labels(self) -> list[dict]:
+        """Load and verify both label streams without an unsafe shared cache."""
+        detect_files = self._label_paths(self.im_files, "_det.txt")
+        segment_files = self._label_paths(self.im_files, "_seg.txt")
+        labels = []
+        files = zip(self.im_files, detect_files, segment_files)
+        progress = TQDM(files, desc=f"{self.prefix}Scanning detect-segment labels", total=len(self.im_files))
+        for im_file, detect_file, segment_file in progress:
+            branches = []
+            for label_file, names in (
+                (detect_file, self.data["detect_names"]),
+                (segment_file, self.data["segment_names"]),
+            ):
+                supervised = Path(label_file).is_file()
+                result = verify_image_label(
+                    (im_file, label_file, self.prefix, False, len(names), 0, 0, self.single_cls)
+                )
+                if result[9]:
+                    LOGGER.info(result[9])
+                if result[8]:
+                    raise ValueError(result[9])
+                branches.append((result, supervised))
+            (detect, detect_supervised), (segment, segment_supervised) = branches
+            if not detect_supervised and not segment_supervised:
+                raise FileNotFoundError(f"{im_file} requires at least one _det.txt or _seg.txt label")
+            if len(segment[1]) != len(segment[3]):
+                raise ValueError(f"Segment labels require polygons in {segment_file}")
+            labels.append(
+                {
+                    "im_file": im_file,
+                    "shape": detect[2],
+                    "detect_cls": detect[1][:, :1],
+                    "detect_bboxes": detect[1][:, 1:],
+                    "segment_cls": segment[1][:, :1],
+                    "segment_bboxes": segment[1][:, 1:],
+                    "segment_segments": segment[3],
+                    "detect_supervised": detect_supervised,
+                    "segment_supervised": segment_supervised,
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+            )
+        progress.close()
+        return labels
+
+    def update_labels(self, include_class: list[int] | None) -> None:
+        """Keep paired class spaces independent; shared class filtering is unsupported."""
+        if include_class is not None:
+            raise ValueError("classes filtering is not supported for detect-segment datasets")
+        if self.single_cls:
+            for label in self.labels:
+                label["detect_cls"][:] = 0
+                label["segment_cls"][:] = 0
+
+    def update_labels_info(self, label: dict) -> dict:
+        """Create independent Instances objects for the shared transform pipeline."""
+        bbox_format = label.pop("bbox_format")
+        normalized = label.pop("normalized")
+        label["detect_instances"] = Instances(
+            label.pop("detect_bboxes"),
+            np.zeros((0, 1000, 2), dtype=np.float32),
+            bbox_format=bbox_format,
+            normalized=normalized,
+        )
+        segments = label.pop("segment_segments")
+        if segments:
+            segments = np.stack(resample_segments(segments, n=1000), axis=0)
+        else:
+            segments = np.zeros((0, 1000, 2), dtype=np.float32)
+        label["segment_instances"] = Instances(
+            label.pop("segment_bboxes"), segments, bbox_format=bbox_format, normalized=normalized
+        )
+        return label
+
+    def build_transforms(self, hyp: dict | None = None) -> Compose:
+        """Build the conservative paired pipeline: shared LetterBox and optional image-only HSV."""
+        if self.augment:
+            unsupported = [name for name in ("mosaic", "mixup", "cutmix", "copy_paste") if getattr(hyp, name)]
+            if unsupported:
+                raise ValueError(f"detect-segment does not support paired augmentation: {', '.join(unsupported)}")
+            if hyp.degrees or hyp.translate or hyp.scale or hyp.shear or hyp.perspective or hyp.fliplr or hyp.flipud:
+                raise ValueError(
+                    "detect-segment supports only LetterBox and image-only HSV geometric training transforms"
+                )
+        transforms = Compose([DetectSegmentLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment)])
+        if self.augment and (augmentations := getattr(hyp, "augmentations", None)):
+            albumentations = Albumentations(transforms=augmentations)
+            if getattr(albumentations, "contains_spatial", False):
+                raise ValueError("detect-segment does not support custom spatial Albumentations")
+            transforms.append(albumentations)
+        if self.augment and (hyp.hsv_h or hyp.hsv_s or hyp.hsv_v):
+            from .augment import RandomHSV
+
+            transforms.append(RandomHSV(hyp.hsv_h, hyp.hsv_s, hyp.hsv_v))
+        transforms.append(
+            DetectSegmentFormat(
+                bbox_format="xywh",
+                normalize=True,
+                mask_ratio=hyp.mask_ratio,
+                mask_overlap=hyp.overlap_mask,
+                batch_idx=True,
+                bgr=hyp.bgr if self.augment else 0.0,
+            )
+        )
+        return transforms
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Collate paired targets while offsetting each branch batch index independently."""
+        new_batch = {}
+        for key in batch[0]:
+            values = [sample[key] for sample in batch]
+            if key in {"img", "segment_sem_masks"}:
+                new_batch[key] = torch.stack(values)
+            elif key.endswith("_supervised"):
+                new_batch[key] = torch.tensor(values, dtype=torch.bool)
+            elif key.endswith(("_cls", "_bboxes", "_masks")):
+                new_batch[key] = torch.cat(values)
+            elif key.endswith("_batch_idx"):
+                new_batch[key] = torch.cat([value + i for i, value in enumerate(values)])
+            else:
+                new_batch[key] = tuple(values)
         return new_batch
 
 

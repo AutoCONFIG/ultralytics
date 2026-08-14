@@ -48,6 +48,8 @@ from ultralytics.nn.modules import (
     ConvTranspose,
     Depth,
     Detect,
+    DetectSegment,
+    DetectSegment26,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -90,6 +92,7 @@ from ultralytics.utils import (
 )
 from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
+    DetectSegmentLoss,
     DepthLoss26,
     E2ELoss,
     PoseLoss26,
@@ -664,6 +667,86 @@ class SegmentationModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
+
+
+class DetectionSegmentationModel(DetectionModel):
+    """YOLO model with independent detection and instance-segmentation branches on one shared feature graph."""
+
+    def __init__(
+        self,
+        cfg="yolo26n-detect-segment.yaml",
+        ch=3,
+        detect_nc=None,
+        segment_nc=None,
+        verbose=True,
+    ):
+        """Initialize a composite detection-segmentation model from YAML."""
+        BaseModel.__init__(self)
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
+        self.yaml["channels"] = ch
+        if detect_nc is not None:
+            self.yaml["detect_nc"] = detect_nc
+        if segment_nc is not None:
+            self.yaml["segment_nc"] = segment_nc
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+        self.names = {i: f"{i}" for i in range(self.yaml["detect_nc"])}
+        self.detect_names = {i: f"{i}" for i in range(self.yaml["detect_nc"])}
+        self.segment_names = {i: f"{i}" for i in range(self.yaml["segment_nc"])}
+        self.inplace = self.yaml.get("inplace", True)
+
+        head = self.model[-1]
+        size = 256
+        self.model.eval()
+        head.train()
+        outputs = self.forward(torch.zeros(1, ch, size, size))
+        detect_outputs = outputs[0]["one2many"] if head.detect.end2end else outputs[0]
+        head.stride = torch.tensor([size / feature.shape[-2] for feature in detect_outputs["feats"]])
+        self.stride = head.stride
+        self.model.train()
+        head.bias_init()
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    @property
+    def end2end(self):
+        """Return whether both child heads use end-to-end mode."""
+        head = self.model[-1]
+        return head.detect.end2end and head.segment.end2end
+
+    @end2end.setter
+    def end2end(self, value):
+        """Set end-to-end mode on both child heads."""
+        head = self.model[-1]
+        head.detect.end2end = value
+        head.segment.end2end = value
+
+    def _predict_augment(self, x):
+        """Reject test-time augmentation because composite output merging is undefined."""
+        raise NotImplementedError("DetectionSegmentationModel does not support augment=True prediction.")
+
+    def init_criterion(self):
+        """Initialize the composite detection-segmentation criterion."""
+        return DetectSegmentLoss(self)
+
+    def _remap_cls_by_names(self, csd, src_model, verbose=True):
+        """Disable generic remapping because branch class namespaces are independent."""
+        _ = csd, src_model, verbose
+        return 0
+
+    def _apply(self, fn):
+        """Migrate cached tensors on both child heads."""
+        torch.nn.Module._apply(self, fn)
+        head = self.model[-1]
+        head.detect.stride = fn(head.detect.stride)
+        head.detect.anchors = fn(head.detect.anchors)
+        head.detect.strides = fn(head.detect.strides)
+        head.segment.stride = head.detect.stride
+        head.segment.anchors = fn(head.segment.anchors)
+        head.segment.strides = fn(head.segment.strides)
+        self.stride = head.stride
+        return self
 
 
 class SemanticSegmentationModel(BaseModel):
@@ -1949,7 +2032,9 @@ def parse_model(d, ch, verbose=True):
     # Args
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
-    nc, act, scales, end2end = (d.get(x) for x in ("nc", "activation", "scales", "end2end"))
+    nc, detect_nc, segment_nc, act, scales, end2end = (
+        d.get(x) for x in ("nc", "detect_nc", "segment_nc", "activation", "scales", "end2end")
+    )
     reg_max = d.get("reg_max", 16)
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
@@ -2083,6 +2168,8 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                DetectSegment,
+                DetectSegment26,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
@@ -2096,9 +2183,24 @@ def parse_model(d, ch, verbose=True):
             }
         ):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
+            if m in {DetectSegment, DetectSegment26}:
+                args[3] = make_divisible(min(args[3], max_channels) * width, 8)
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                DetectSegment,
+                DetectSegment26,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
         elif m is Depth:
             args = [*args[:1], [ch[x] for x in f]]  # c_mid, ch tuple; drops the legacy mode arg old checkpoints store
@@ -2188,6 +2290,8 @@ def guess_model_task(model):
     def cfg2task(cfg):
         """Guess from YAML dictionary."""
         m = cfg["head"][-1][-2].lower()  # output module name
+        if m in {"detectsegment", "detectsegment26"}:
+            return "detect-segment"
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
         if "detect" in m:
@@ -2216,7 +2320,9 @@ def guess_model_task(model):
             with contextlib.suppress(Exception):
                 return cfg2task(eval(x))  # nosec B307: safe eval of known attribute paths
         for m in model.modules():
-            if isinstance(m, SemanticSegment):
+            if isinstance(m, DetectSegment):
+                return "detect-segment"
+            elif isinstance(m, SemanticSegment):
                 return "semantic"
             elif isinstance(m, (Segment, YOLOESegment)):
                 return "segment"
@@ -2234,7 +2340,9 @@ def guess_model_task(model):
     # Guess from model filename
     if isinstance(model, (str, Path)):
         model = Path(model)
-        if "-sem" in model.stem or "semantic" in model.parts:
+        if "detect-segment" in model.stem:
+            return "detect-segment"
+        elif "-sem" in model.stem or "semantic" in model.parts:
             return "semantic"
         elif "-seg" in model.stem or "segment" in model.parts:
             return "segment"

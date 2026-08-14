@@ -1907,6 +1907,22 @@ class LetterBox(BaseTransform):
         return labels
 
 
+class DetectSegmentLetterBox(LetterBox):
+    """Apply one letterbox geometry to independent detection and segmentation instances."""
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+        """Update both target streams with the shared image geometry."""
+        for key in ("detect_instances", "segment_instances"):
+            branch = {"instances": labels[key]}
+            branch = self._update_labels(
+                branch, params["ratio"], params["left"], params["top"], params["orig_shape"]
+            )
+            labels[key] = branch["instances"]
+        if labels.get("ratio_pad"):
+            labels["ratio_pad"] = (labels["ratio_pad"], (params["left"], params["top"]))
+        return labels
+
+
 class CopyPaste(BaseMixTransform):
     """CopyPaste class for applying Copy-Paste augmentation to image datasets.
 
@@ -2482,6 +2498,39 @@ class Format(BaseTransform):
             masks = polygons2masks((h, w), segments, color=1, downsample_ratio=self.mask_ratio)
 
         return masks, instances, cls
+
+
+class DetectSegmentFormat(Format):
+    """Format independent detection and segmentation targets without merging their class spaces."""
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Format the image once and each target stream with the stock formatter."""
+        raw_image = labels.pop("img")
+        image = self._format_img(raw_image)
+        output = labels
+        for branch, return_mask in (("detect", False), ("segment", True)):
+            branch_labels = {
+                "img": raw_image,
+                "cls": output.pop(f"{branch}_cls"),
+                "instances": output.pop(f"{branch}_instances"),
+            }
+            formatter = Format(
+                bbox_format=self.bbox_format,
+                normalize=self.normalize,
+                return_mask=return_mask,
+                mask_ratio=self.mask_ratio,
+                mask_overlap=self.mask_overlap,
+                batch_idx=self.batch_idx,
+            )
+            formatted = formatter.apply_instances(branch_labels, formatter.get_params(branch_labels))
+            output[f"{branch}_cls"] = formatted["cls"]
+            output[f"{branch}_bboxes"] = formatted["bboxes"]
+            output[f"{branch}_batch_idx"] = formatted["batch_idx"]
+            if return_mask:
+                output["segment_masks"] = formatted["masks"]
+                output["segment_sem_masks"] = formatted["sem_masks"]
+        output["img"] = image
+        return output
 
 
 class SemanticFormat(Format):

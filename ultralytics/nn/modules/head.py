@@ -25,6 +25,8 @@ __all__ = (
     "Classify",
     "Depth",
     "Detect",
+    "DetectSegment",
+    "DetectSegment26",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -367,6 +369,90 @@ class Segment(Detect):
         self.cv2 = self.cv3 = self.cv4 = None
 
 
+class DetectSegment(nn.Module):
+    """Composite head that runs independent detection and instance-segmentation heads on shared features."""
+
+    legacy = False
+    segment_type = Segment
+
+    def __init__(
+        self,
+        detect_nc: int,
+        segment_nc: int,
+        nm: int = 32,
+        npr: int = 256,
+        reg_max: int = 16,
+        end2end: bool = False,
+        ch: tuple = (),
+    ):
+        """Initialize independent stock heads with separate class counts."""
+        super().__init__()
+        self.detect = Detect.__new__(Detect)
+        self.detect.legacy = self.legacy
+        Detect.__init__(self.detect, detect_nc, reg_max, end2end, ch)
+        self.segment = self.segment_type.__new__(self.segment_type)
+        self.segment.legacy = self.legacy
+        self.segment_type.__init__(self.segment, segment_nc, nm, npr, reg_max, end2end, ch)
+
+    @property
+    def stride(self) -> torch.Tensor:
+        """Return the shared feature strides."""
+        return self.detect.stride
+
+    @stride.setter
+    def stride(self, value: torch.Tensor) -> None:
+        """Set feature strides on both child heads."""
+        self.detect.stride = value
+        self.segment.stride = value
+
+    @property
+    def export(self) -> bool:
+        """Return whether child heads are in export mode."""
+        return self.detect.export
+
+    @export.setter
+    def export(self, value: bool) -> None:
+        """Set export mode on both child heads."""
+        self.detect.export = value
+        self.segment.export = value
+
+    @property
+    def format(self) -> str | None:
+        """Return the child export format."""
+        return self.detect.format
+
+    @format.setter
+    def format(self, value: str | None) -> None:
+        """Set export format on both child heads."""
+        self.detect.format = value
+        self.segment.format = value
+
+    @property
+    def dynamic(self) -> bool:
+        """Return whether child heads rebuild anchors dynamically."""
+        return self.detect.dynamic
+
+    @dynamic.setter
+    def dynamic(self, value: bool) -> None:
+        """Set dynamic anchor rebuilding on both child heads."""
+        self.detect.dynamic = value
+        self.segment.dynamic = value
+
+    def forward(self, x: list[torch.Tensor]) -> tuple:
+        """Return detection and segmentation outputs from the same feature objects."""
+        return self.detect(x), self.segment(x)
+
+    def bias_init(self) -> None:
+        """Initialize biases for both child heads."""
+        self.detect.bias_init()
+        self.segment.bias_init()
+
+    def fuse(self) -> None:
+        """Fuse both child heads for inference."""
+        self.detect.fuse()
+        self.segment.fuse()
+
+
 class Segment26(Segment):
     """YOLO26 Segment head for segmentation models.
 
@@ -424,6 +510,12 @@ class Segment26(Segment):
         super().fuse()
         if hasattr(self.proto, "fuse"):
             self.proto.fuse()
+
+
+class DetectSegment26(DetectSegment):
+    """YOLO26 composite detection and instance-segmentation head."""
+
+    segment_type = Segment26
 
 
 class OBB(Detect):

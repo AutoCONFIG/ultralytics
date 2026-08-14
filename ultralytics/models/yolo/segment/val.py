@@ -58,6 +58,7 @@ class SegmentationValidator(DetectionValidator):
             (dict[str, Any]): Preprocessed batch.
         """
         batch = super().preprocess(batch)
+        self.batch_imgsz = batch["img"].shape[2:]
         batch["masks"] = batch["masks"].float()
         return batch
 
@@ -100,7 +101,7 @@ class SegmentationValidator(DetectionValidator):
         """
         proto = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         preds = super().postprocess(preds[0])
-        imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
+        imgsz = getattr(self, "batch_imgsz", None) or [4 * x for x in proto.shape[2:]]
         for i, pred in enumerate(preds):
             coefficient = pred.pop("extra")
             pred["masks"] = self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
@@ -161,7 +162,10 @@ class SegmentationValidator(DetectionValidator):
         if gt_cls.shape[0] == 0 or preds["cls"].shape[0] == 0:
             tp_m = np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)
         else:
-            iou = mask_iou(batch["masks"].flatten(1), preds["masks"].flatten(1).float())  # float, uint8
+            pred_masks = preds["masks"].float()
+            if pred_masks.shape[1:] != batch["masks"].shape[1:]:
+                pred_masks = F.interpolate(pred_masks[None], batch["masks"].shape[1:], mode="nearest")[0]
+            iou = mask_iou(batch["masks"].flatten(1), pred_masks.flatten(1))
             tp_m = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
         tp.update({"tp_m": tp_m})  # update tp with mask IoU
         return tp

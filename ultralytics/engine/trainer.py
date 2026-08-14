@@ -26,7 +26,12 @@ from torch import nn, optim
 
 from ultralytics import __version__
 from ultralytics.cfg import _YOLO_CLI_COMMAND, get_cfg, get_save_dir
-from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
+from ultralytics.data.utils import (
+    check_cls_dataset,
+    check_det_dataset,
+    check_detect_segment_dataset,
+    convert_ndjson_to_yolo_if_needed,
+)
 from ultralytics.nn.distill_model import DistillationModel
 from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.optim import MuSGD
@@ -789,8 +794,13 @@ class BaseTrainer:
                 "obb",
                 "semantic",
                 "depth",
+                "detect-segment",
             }:
-                data = check_det_dataset(self.args.data)
+                data = (
+                    check_detect_segment_dataset(self.args.data)
+                    if self.args.task == "detect-segment"
+                    else check_det_dataset(self.args.data)
+                )
                 if "yaml_file" in data:
                     self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
         except Exception as e:

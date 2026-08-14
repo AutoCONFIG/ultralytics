@@ -475,7 +475,9 @@ def convert_ndjson_to_yolo_if_needed(data: str | Path) -> str | Path:
     return data
 
 
-def check_det_dataset(dataset: str, autodownload: bool = True, split: str = "") -> dict[str, Any]:
+def check_det_dataset(
+    dataset: str, autodownload: bool = True, split: str = "", task: str = "detect"
+) -> dict[str, Any]:
     """Download, verify, and/or unzip a dataset if not found locally.
 
     This function checks the availability of a specified dataset, and if not found, it has the option to download and
@@ -486,6 +488,7 @@ def check_det_dataset(dataset: str, autodownload: bool = True, split: str = "") 
         dataset (str): Path to the dataset or dataset descriptor (like a YAML file).
         autodownload (bool, optional): Whether to automatically download the dataset if not found.
         split (str, optional): Dataset split required by the caller.
+        task (str, optional): Dataset task, used only to select the paired detect-segment names key.
 
     Returns:
         (dict[str, Any]): Parsed dataset information and paths.
@@ -507,6 +510,9 @@ def check_det_dataset(dataset: str, autodownload: bool = True, split: str = "") 
 
     # Read YAML
     data = YAML.load(file, append_filename=True)  # dictionary
+
+    if task == "detect-segment" and "names" not in data:
+        data["names"] = data.get("detect_names")
 
     # Checks
     for k in "train", "val":
@@ -584,6 +590,21 @@ def check_det_dataset(dataset: str, autodownload: bool = True, split: str = "") 
     check_font("Arial.ttf" if is_ascii(data["names"]) else "Arial.Unicode.ttf")  # download fonts
 
     return data  # dictionary
+
+
+def check_detect_segment_dataset(dataset: str, autodownload: bool = True, split: str = "") -> dict[str, Any]:
+    raw = YAML.load(check_file(dataset), append_filename=True)
+    required = ("detect_names", "segment_names")
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise SyntaxError(f"{dataset} missing detect-segment keys: {', '.join(missing)}")
+
+    data = check_det_dataset(dataset, autodownload=autodownload, split=split, task="detect-segment")
+    data["detect_names"] = check_class_names(raw["detect_names"])
+    data["segment_names"] = check_class_names(raw["segment_names"])
+    data["detect_nc"] = len(data["detect_names"])
+    data["segment_nc"] = len(data["segment_names"])
+    return data
 
 
 def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:

@@ -39,7 +39,12 @@ import torch
 import torch.distributed as dist
 
 from ultralytics.cfg import get_cfg, get_save_dir
-from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
+from ultralytics.data.utils import (
+    check_cls_dataset,
+    check_det_dataset,
+    check_detect_segment_dataset,
+    convert_ndjson_to_yolo_if_needed,
+)
 from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import LOCAL_RANK, LOGGER, RANK, TQDM, callbacks, colorstr, emojis
 from ultralytics.utils.checks import check_imgsz
@@ -217,8 +222,13 @@ class BaseValidator:
                 "obb",
                 "semantic",
                 "depth",
+                "detect-segment",
             }:
-                self.data = check_det_dataset(self.args.data, split=self.args.split)
+                self.data = (
+                    check_detect_segment_dataset(self.args.data, split=self.args.split)
+                    if self.args.task == "detect-segment"
+                    else check_det_dataset(self.args.data, split=self.args.split)
+                )
             else:
                 raise FileNotFoundError(emojis(f"Dataset '{self.args.data}' for task={self.args.task} not found ❌"))
 

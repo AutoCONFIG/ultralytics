@@ -188,6 +188,80 @@ class DepthMap(BaseTensor):
         return 1
 
 
+class DetectSegmentResults(SimpleClass):
+    """Store independent stock detection and segmentation results for one image."""
+
+    def __init__(self, detect, segment) -> None:
+        """Initialize a nested result while preserving the normal prediction metadata surface."""
+        self.detect = detect
+        self.segment = segment
+        self.orig_img = detect.orig_img
+        self.orig_shape = detect.orig_shape
+        self.path = detect.path
+        self.names = detect.names
+        self.speed = detect.speed
+        self.save_dir = None
+
+    def __len__(self) -> int:
+        """Return the total number of branch predictions."""
+        return len(self.detect) + len(self.segment)
+
+    def _apply(self, method: str, *args, **kwargs):
+        """Apply a tensor conversion to both nested results."""
+        result = self.__class__(
+            getattr(self.detect, method)(*args, **kwargs), getattr(self.segment, method)(*args, **kwargs)
+        )
+        result.speed = self.speed
+        result.save_dir = self.save_dir
+        return result
+
+    def cpu(self):
+        """Move both branches to CPU."""
+        return self._apply("cpu")
+
+    def numpy(self):
+        """Convert both branches to NumPy."""
+        return self._apply("numpy")
+
+    def cuda(self):
+        """Move both branches to CUDA."""
+        return self._apply("cuda")
+
+    def to(self, *args, **kwargs):
+        """Move both branches to a device or dtype."""
+        return self._apply("to", *args, **kwargs)
+
+    def plot(self, **kwargs) -> np.ndarray:
+        """Plot segmentation first and detection on the resulting image."""
+        plot_kwargs = {**kwargs, "show": False, "save": False}
+        image = self.segment.plot(**plot_kwargs)
+        return self.detect.plot(img=image, **kwargs)
+
+    def verbose(self) -> str:
+        """Return branch-prefixed stock prediction summaries."""
+        return f"detect: {self.detect.verbose()}segment: {self.segment.verbose()}"
+
+    def save_txt(self, txt_file: str | Path, save_conf: bool = False) -> str:
+        """Save each branch to an explicitly suffixed label file."""
+        path = Path(txt_file)
+        self.detect.save_txt(path.with_name(f"{path.stem}_detect{path.suffix}"), save_conf=save_conf)
+        self.segment.save_txt(path.with_name(f"{path.stem}_segment{path.suffix}"), save_conf=save_conf)
+        return str(path)
+
+    def save_crop(self, save_dir: str | Path, file_name: str | Path = Path("im.jpg")) -> None:
+        """Save each branch's crops under an independent directory."""
+        save_dir = Path(save_dir)
+        self.detect.save_crop(save_dir / "detect", file_name)
+        self.segment.save_crop(save_dir / "segment", file_name)
+
+    def summary(self, normalize: bool = False, decimals: int = 5) -> dict[str, list[dict[str, Any]]]:
+        """Return branch-separated stock summaries."""
+        return {
+            "detect": self.detect.summary(normalize=normalize, decimals=decimals),
+            "segment": self.segment.summary(normalize=normalize, decimals=decimals),
+        }
+
+
 class Results(SimpleClass, DataExportMixin):
     """A class for storing and manipulating inference results.
 

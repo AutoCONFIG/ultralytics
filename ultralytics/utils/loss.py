@@ -648,6 +648,125 @@ class v8SegmentationLoss(v8DetectionLoss):
         return loss / fg_mask.sum()
 
 
+class _DetectSegmentLossModel(torch.nn.Module):
+    """Expose one composite child head through the stock loss-model contract."""
+
+    def __init__(self, model: torch.nn.Module, branch: str):
+        """Bind one composite branch while retaining the model hyperparameters."""
+        super().__init__()
+        self.args = model.args
+        self.model = torch.nn.ModuleList([getattr(model.model[-1], branch)])
+        self.class_weights = getattr(model, "class_weights", None)
+
+
+class DetectSegmentLoss:
+    """Combine independent stock detection and segmentation criteria for one composite forward."""
+
+    def __init__(self, model: torch.nn.Module):
+        """Initialize branch criteria against their child heads."""
+        detect_model = _DetectSegmentLossModel(model, "detect")
+        segment_model = _DetectSegmentLossModel(model, "segment")
+        self.end2end = model.end2end
+        self.detect = E2ELoss(detect_model, v8DetectionLoss) if self.end2end else v8DetectionLoss(detect_model)
+        self.segment = E2ELoss(segment_model, v8SegmentationLoss) if self.end2end else v8SegmentationLoss(segment_model)
+        if self.end2end:
+            self.segment.one2many.class_weights = None
+            self.segment.one2one.class_weights = None
+        else:
+            self.segment.class_weights = None
+        self.overlap = self.segment.one2many.overlap if self.end2end else self.segment.overlap
+        self.updates = 0
+        self.loss_names = tuple(
+            [f"detect_{name}" for name in self.detect.loss_names]
+            + [f"segment_{name}" for name in self.segment.loss_names]
+        )
+
+    def _branch_batch(
+        self, batch: dict[str, torch.Tensor], branch: str, image_indices: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Adapt one supervised subset of paired targets to a stock branch criterion."""
+        batch_idx = batch[f"{branch}_batch_idx"]
+        target_mask = (batch_idx[:, None] == image_indices).any(1)
+        target_indices = batch_idx[target_mask]
+        remapped_batch_idx = (target_indices[:, None] == image_indices).nonzero()[:, 1].to(batch_idx.dtype)
+        adapted = {
+            "batch_idx": remapped_batch_idx,
+            "cls": batch[f"{branch}_cls"][target_mask],
+            "bboxes": batch[f"{branch}_bboxes"][target_mask],
+        }
+        if branch == "segment":
+            adapted["masks"] = (
+                batch["segment_masks"][image_indices] if self.overlap else batch["segment_masks"][target_mask]
+            )
+            adapted["sem_masks"] = (
+                batch["segment_sem_masks"][image_indices]
+                if self.end2end
+                else torch.empty(0, device=batch["segment_masks"].device)
+            )
+        return adapted
+
+    @staticmethod
+    def _slice(preds, image_indices: torch.Tensor, batch_size: int):
+        """Select supervised images from every batch-shaped tensor in a prediction container."""
+        if isinstance(preds, torch.Tensor):
+            return preds[image_indices] if preds.ndim and preds.shape[0] == batch_size else preds
+        if isinstance(preds, dict):
+            return {key: DetectSegmentLoss._slice(value, image_indices, batch_size) for key, value in preds.items()}
+        if isinstance(preds, list):
+            return [DetectSegmentLoss._slice(value, image_indices, batch_size) for value in preds]
+        if isinstance(preds, tuple):
+            return tuple(DetectSegmentLoss._slice(value, image_indices, batch_size) for value in preds)
+        return preds
+
+    @staticmethod
+    def _zero(preds) -> torch.Tensor:
+        """Return a graph-connected zero spanning every branch output tensor."""
+        tensors, containers = [], [preds]
+        while containers:
+            value = containers.pop()
+            if isinstance(value, torch.Tensor):
+                tensors.append(value)
+            elif isinstance(value, dict):
+                containers.extend(value.values())
+            elif isinstance(value, (list, tuple)):
+                containers.extend(value)
+        return torch.stack([(value * 0).sum() for value in tensors]).sum()
+
+    def __call__(
+        self, preds: tuple, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return summed branch loss and a stable branch-prefixed item order."""
+        batch_size = batch["img"].shape[0]
+        losses = []
+        branch_items = []
+        for branch, criterion, branch_preds in (
+            ("detect", self.detect, preds[0]),
+            ("segment", self.segment, preds[1]),
+        ):
+            image_indices = batch[f"{branch}_supervised"].nonzero().flatten()
+            zero = self._zero(branch_preds)
+            if image_indices.numel():
+                selected_preds = self._slice(branch_preds, image_indices, batch_size)
+                loss, items = criterion(selected_preds, self._branch_batch(batch, branch, image_indices))
+                loss[0] += zero
+            else:
+                loss = zero.repeat(len(criterion.loss_names))
+                items = dict.fromkeys(criterion.loss_names, zero.detach())
+            losses.append(loss)
+            branch_items.append((branch, items))
+        items = {
+            f"{branch}_{name}": value for branch, values in branch_items for name, value in values.items()
+        }
+        return torch.cat(losses), items
+
+    def update(self) -> None:
+        if self.end2end:
+            for criterion in (self.detect, self.segment):
+                criterion.updates = self.updates
+                criterion.update()
+            self.updates += 1
+
+
 class v8PoseLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 pose estimation."""
 
@@ -1284,6 +1403,7 @@ class E2ELoss:
         """Initialize E2ELoss with one-to-many and one-to-one detection losses using the provided model."""
         self.one2many = loss_fn(model, tal_topk=10)
         self.one2one = loss_fn(model, tal_topk=7, tal_topk2=1)
+        self.loss_names = self.one2one.loss_names
         self.updates = 0
         self.total = 1.0
         # init gain
