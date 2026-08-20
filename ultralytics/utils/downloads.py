@@ -338,7 +338,7 @@ def safe_download(
             url, file = get_google_drive_file_info(url)
         url = url.replace(" ", "%20")  # encode spaces for curl compatibility
 
-        f = Path(dir or ".") / (file or url2file(url))  # URL converted to filename
+        f = Path(dir or ".") / (Path(file).name if file else url2file(url))  # URL converted to filename
         if not f.is_file():  # URL and file do not exist
             uri = (url if gdrive else clean_url(url)).replace(ASSETS_URL, "https://ultralytics.com/assets")  # clean
             desc = f"Downloading {uri} to '{f}'"

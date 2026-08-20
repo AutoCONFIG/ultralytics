@@ -579,11 +579,13 @@ def check_det_dataset(
             r = None  # success
             if s.startswith("http") and s.endswith(".zip"):  # URL
                 safe_download(url=s, dir=DATASETS_DIR, delete=True)
-            elif s.startswith("bash "):  # bash script
-                LOGGER.info(f"Running {s} ...")
-                subprocess.run(s.split(), check=True)
-            else:  # python script
-                exec(s, {"yaml": data})  # noqa: S102
+            else:
+                # 数据集 YAML 内嵌脚本是任意代码执行入口（供应链注入面），本 fork 不提供自动执行；
+                # 仅支持 URL zip 自动下载，脚本请人工审查后自行运行
+                raise RuntimeError(
+                    f"数据集 '{dataset}' 的 download 字段不是 URL zip（内容为脚本）。"
+                    "为防止代码注入，脚本不会自动执行，请人工审查后手动运行。"
+                )
             dt = f"({round(time.time() - t, 1)}s)"
             s = f"success ✅ {dt}, saved to {colorstr('bold', DATASETS_DIR)}" if r in {0, None} else f"failure {dt} ❌"
             LOGGER.info(f"Dataset download {s}\n")

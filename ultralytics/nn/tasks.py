@@ -2046,9 +2046,9 @@ def parse_model(d, ch, verbose=True):
 
     restricted = _SafeLoad.restricted()
     if act:
-        # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU(). Under restricted loading, resolve the
-        # spec without eval() (see _SafeLoad.activation).
-        Conv.default_act = _SafeLoad.activation(act) if restricted else eval(act)
+        # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU(). Always resolve the spec without
+        # eval() (see _SafeLoad.activation) so model YAMLs cannot inject code through the activation field.
+        Conv.default_act = _SafeLoad.activation(act)
         if verbose:
             LOGGER.info(f"{colorstr('activation:')} {act}")  # print
 
@@ -2313,12 +2313,19 @@ def guess_model_task(model):
             return cfg2task(model)
     # Guess from PyTorch model
     if isinstance(model, torch.nn.Module):  # PyTorch model
-        for x in "model.args", "model.model.args", "model.model.model.args":
+
+        def _nested_attr(obj, path):
+            """Resolve a dotted attribute path like 'model.args' below `obj` without eval()."""
+            for name in path.split("."):
+                obj = getattr(obj, name)
+            return obj
+
+        for x in "args", "model.args", "model.model.args":
             with contextlib.suppress(Exception):
-                return eval(x)["task"]  # nosec B307: safe eval of known attribute paths
-        for x in "model.yaml", "model.model.yaml", "model.model.model.yaml":
+                return _nested_attr(model, x)["task"]
+        for x in "yaml", "model.yaml", "model.model.yaml":
             with contextlib.suppress(Exception):
-                return cfg2task(eval(x))  # nosec B307: safe eval of known attribute paths
+                return cfg2task(_nested_attr(model, x))
         for m in model.modules():
             if isinstance(m, DetectSegment):
                 return "detect-segment"
